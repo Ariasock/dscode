@@ -1,0 +1,43 @@
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// Connect one side of each button to the pin below and the other side to GND.
+const byte buttonPins[] = {2, 3, 4, 5};
+const char *buttonNames[] = {"Button 1", "Button 2", "Button 3", "Button 4"};
+const byte buttonCount = sizeof(buttonPins) / sizeof(buttonPins[0]);
+
+// Most 16x2 I2C displays use address 0x27. Try 0x3F if yours does not work.
+LiquidCrystal_I2C display(0x27, 16, 2);
+
+bool lastState[buttonCount];
+
+void setup() {
+	display.init();
+	display.backlight();
+	display.setCursor(0, 0);
+	display.print("Press a button");
+
+	for (byte i = 0; i < buttonCount; i++) {
+		pinMode(buttonPins[i], INPUT_PULLUP);
+		lastState[i] = digitalRead(buttonPins[i]);
+	}
+}
+
+void loop() {
+	for (byte i = 0; i < buttonCount; i++) {
+		bool currentState = digitalRead(buttonPins[i]);
+
+		// Buttons are LOW when pressed. Only report a new press once.
+		if (lastState[i] == HIGH && currentState == LOW) {
+			display.clear();
+			display.setCursor(0, 0);
+			display.print("Pressed:");
+			display.setCursor(0, 1);
+			display.print(buttonNames[i]);
+			delay(40); // simple switch debouncing
+		}
+
+		lastState[i] = currentState;
+	}
+}
