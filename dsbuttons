@@ -11,7 +11,7 @@
 #define LCD_CD    A2 // Shared with Touch XM (must be analog)
 #define LCD_WR    A1
 #define LCD_RD    A0
-#define LCD_RESET 13 // Rewired from A4 to Digital Pin 13!
+#define LCD_RESET 13 // Rewired from A4 to Digital Pin 13
 
 // Touchscreen shared pins
 #define YP A3
@@ -20,6 +20,7 @@
 #define XP 8
 
 // Touch calibration for Elegoo 2.8" TFT
+// Note: If touch pads feel mirrored on your screen, swap TS_MINX/TS_MAXX or TS_MINY/TS_MAXY
 #define TS_MINX 120
 #define TS_MAXX 900
 #define TS_MINY 70
@@ -28,20 +29,18 @@
 #define MAXPRESSURE 1000
 
 // 3 Momentary Push Buttons (Wired between pin and GND)
-// Note: If you wired buttons to SDA/SCL instead, SDA is A4 and SCL is A5
 #define BTN_1 10
 #define BTN_2 11
 #define BTN_3 12
 
-// SparkFun Slide Thumbstick (Analog inputs freed up by moving LCD_RESET)
+// Slide Thumbstick (Analog inputs freed up by moving LCD_RESET)
 #define STICK_X A4
 #define STICK_Y A5
 
-// Thumbstick analog thresholds (0 to 1023, center is ~512)
-#define STICK_LOW        300
-#define STICK_HIGH       720
-#define STICK_CENTER_MIN 380
-#define STICK_CENTER_MAX 640
+// Slide thumbsticks have shorter throw and off-center springs than full joysticks.
+// We calibrate the center at boot and use relative distances from center:
+#define STICK_TRIGGER_DIST 180 // Distance from center needed to register a slide
+#define STICK_RELEASE_DIST 110 // Distance from center considered back at rest
 
 // 16-bit RGB565 Color Definitions
 #define BLACK    0x0000
@@ -74,30 +73,81 @@ TouchScreen ts = TouchScreen(XP, YP, XM, YM, 300);
 uint8_t sequence[MAX_SEQ_LEN];
 uint8_t currentSeqLen = 3;
 
-uint8_t currentStage = 1;         // Stages 1 to 5
-uint8_t levelInStage = 0;         // Current level index within the 5-level stage (0 to 4)
-uint8_t winsInStage = 0;          // Need 3 wins out of the 5 levels to advance
-uint8_t failsInStage = 0;         // 3 fails in one stage = Game Over
-uint8_t totalErrors = 0;          // Must be 0 to unlock Stage 5 endless overtime loop
-uint8_t stage5Loops = 0;          // Count of Stage 5 clears
+uint8_t currentStage = 1;          // Stages 1 to 5
+uint8_t levelInStage = 0;          // Current level index within the 5-level stage (0 to 4)
+uint8_t winsInStage = 0;           // Need 3 wins out of the 5 levels to advance
+uint8_t failsInStage = 0;          // 3 fails in one stage = Game Over
+uint8_t totalErrors = 0;           // Must be 0 to unlock Stage 5 endless overtime loop
+uint8_t stage5Loops = 0;           // Count of Stage 5 clears
+bool isFirstBoot = true;           // Tracks whether we need to seed RNG on first start
 
-uint8_t stagePool[5];             // Holds the 5 randomized minigame types for the stage
+uint8_t stagePool[5];              // Holds the 5 randomized minigame types for the stage
 unsigned long timeLimitMs = 20000; // Default 20.0s (20000 ms), cuts 2.5s per Stage 5 win
 uint8_t activeGame = GAME_TOUCH;
+
+// Auto-calibrated resting center for the slide thumbstick
+int stickCenterX = 512;
+int stickCenterY = 512;
 
 // ==========================================
 // 3. HARDWARE & UTILITY HELPERS
 // ==========================================
 
-// Restore shared A2/A3 pins back to OUTPUT after reading TouchScreen
+// Restore shared A2/A3 pins back to OUTPUT and HIGH after reading TouchScreen
 void restoreTFTPins() {
   pinMode(XM, OUTPUT);
   pinMode(YP, OUTPUT);
+  digitalWrite(XM, HIGH);
+  digitalWrite(YP, HIGH);
+}
+
+// Read resting center of the slide thumbstick on startup
+void calibrateThumbstick() {
+  long sumX = 0;
+  long sumY = 0;
+  for (uint8_t i = 0; i < 16; i++) {
+    sumX += analogRead(STICK_X);
+    sumY += analogRead(STICK_Y);
+    delay(5);
+  }
+  stickCenterX = sumX / 16;
+  stickCenterY = sumY / 16;
+
+  // Fallback if thumbstick was held during power-on
+  if (stickCenterX < 300 || stickCenterX > 720) stickCenterX = 512;
+  if (stickCenterY < 300 || stickCenterY > 720) stickCenterY = 512;
+}
+
+// Check if any input is currently held down
+bool isAnyInputHeld() {
+  if (digitalRead(BTN_1) == LOW || digitalRead(BTN_2) == LOW || digitalRead(BTN_3) == LOW) {
+    return true;
+  }
+
+  int dx = abs(analogRead(STICK_X) - stickCenterX);
+  int dy = abs(analogRead(STICK_Y) - stickCenterY);
+  if (dx > STICK_RELEASE_DIST || dy > STICK_RELEASE_DIST) {
+    return true;
+  }
+
+  TSPoint p = ts.getPoint();
+  restoreTFTPins();
+  if (p.z > MINPRESSURE && p.z < MAXPRESSURE) {
+    return true;
+  }
+
+  return false;
+}
+
+// Wait until buttons are unpressed, thumbstick is centered, and screen is untouched
+void waitForRelease() {
+  while (isAnyInputHeld()) {
+    delay(15);
+  }
 }
 
 // Populate and shuffle the 5 levels for the current stage
 void generateStagePool() {
-  // Base pool guarantees all 3 minigame types appear in the 5-level set
   stagePool[0] = GAME_TOUCH;
   stagePool[1] = GAME_STICK;
   stagePool[2] = GAME_BUTTONS;
@@ -110,31 +160,6 @@ void generateStagePool() {
     uint8_t temp = stagePool[i];
     stagePool[i] = stagePool[j];
     stagePool[j] = temp;
-  }
-}
-
-// Wait until buttons are unpressed, thumbstick is centered, and screen is untouch
-void waitForRelease() {
-  bool holding = true;
-  while (holding) {
-    holding = false;
-
-    if (digitalRead(BTN_1) == LOW || digitalRead(BTN_2) == LOW || digitalRead(BTN_3) == LOW) {
-      holding = true;
-    }
-
-    int sx = analogRead(STICK_X);
-    int sy = analogRead(STICK_Y);
-    if (sx < STICK_CENTER_MIN || sx > STICK_CENTER_MAX || sy < STICK_CENTER_MIN || sy > STICK_CENTER_MAX) {
-      holding = true;
-    }
-
-    TSPoint p = ts.getPoint();
-    restoreTFTPins();
-    if (p.z > MINPRESSURE && p.z < MAXPRESSURE) {
-      holding = true;
-    }
-    delay(15);
   }
 }
 
@@ -156,7 +181,7 @@ void drawHUD() {
     tft.print(stage5Loops);
   }
 
-  // Show progress: Wins needed (W:x/3) and current Level in stage (L:x/5)
+  // Show progress: Wins needed (W:x/3) and current Level in stage (L:x)
   tft.setTextColor(CYAN);
   tft.setCursor(105, 6);
   tft.print("W:");
@@ -169,7 +194,7 @@ void drawHUD() {
   tft.fillRect(10, 32, 220, 10, GREEN);
 }
 
-void updateTimerBar(unsigned long elapsed, unsigned long limit, int &lastWidth) {
+void updateTimerBar(unsigned long elapsed, unsigned long limit, int &lastWidth, uint16_t &lastColor) {
   if (elapsed > limit) elapsed = limit;
   int newWidth = map(limit - elapsed, 0, limit, 0, 220);
 
@@ -178,10 +203,17 @@ void updateTimerBar(unsigned long elapsed, unsigned long limit, int &lastWidth) 
     if (newWidth < 110) barColor = YELLOW;
     if (newWidth < 55)  barColor = RED;
 
+    // Erase only the sliver that shrank
     if (newWidth < lastWidth) {
       tft.fillRect(10 + newWidth, 32, lastWidth - newWidth, 10, DARKGREY);
     }
-    tft.fillRect(10, 32, newWidth, 10, barColor);
+
+    // Only redraw the entire remaining bar if the color threshold changed
+    if (barColor != lastColor && newWidth > 0) {
+      tft.fillRect(10, 32, newWidth, 10, barColor);
+      lastColor = barColor;
+    }
+
     lastWidth = newWidth;
   }
 }
@@ -204,7 +236,7 @@ void drawTouchBoard() {
   tft.fillRect(0, 53, 240, 267, BLACK);
   tft.setTextColor(WHITE);
   tft.setTextSize(2);
-  tft.setCursor(35, 62);
+  tft.setCursor(30, 62);
   tft.print("MODE: TOUCH PAD");
   for (uint8_t i = 0; i < 4; i++) {
     drawTouchPad(i, false);
@@ -234,7 +266,7 @@ void drawStickBoard() {
   tft.fillRect(0, 53, 240, 267, BLACK);
   tft.setTextColor(CYAN);
   tft.setTextSize(2);
-  tft.setCursor(30, 62);
+  tft.setCursor(24, 62);
   tft.print("MODE: THUMBSTICK");
   tft.fillCircle(120, 190, 18, DARKGREY);
   for (uint8_t i = 0; i < 4; i++) {
@@ -262,7 +294,7 @@ void drawButtonBoard() {
   tft.fillRect(0, 53, 240, 267, BLACK);
   tft.setTextColor(ORANGE);
   tft.setTextSize(2);
-  tft.setCursor(35, 62);
+  tft.setCursor(30, 62);
   tft.print("MODE: 3 BUTTONS");
   for (uint8_t i = 0; i < 3; i++) {
     drawButtonIcon(i, false);
@@ -280,8 +312,8 @@ void highlightStep(uint8_t val, bool lit) {
 // ==========================================
 
 void playSequence() {
-  // Sequence length grows with stage and Stage 5 loops
-  currentSeqLen = currentStage + 2 + (stage5Loops > 0 ? 1 : 0);
+  // Sequence length scales with stage AND every Stage 5 overtime loop up to MAX_SEQ_LEN (14)
+  currentSeqLen = currentStage + 2 + stage5Loops;
   if (currentSeqLen > MAX_SEQ_LEN) currentSeqLen = MAX_SEQ_LEN;
 
   uint8_t numOptions = (activeGame == GAME_BUTTONS) ? 3 : 4;
@@ -289,9 +321,9 @@ void playSequence() {
     sequence[i] = random(0, numOptions);
   }
 
-  // Flash speed increases each stage
-  int onTime = max(160, 500 - (currentStage * 60) - (stage5Loops * 25));
-  int offTime = max(80, 210 - (currentStage * 25));
+  // Flash speed increases each stage and overtime loop
+  int onTime = max(140, 500 - (currentStage * 60) - (stage5Loops * 25));
+  int offTime = max(70, 210 - (currentStage * 25) - (stage5Loops * 10));
 
   delay(600);
   for (uint8_t i = 0; i < currentSeqLen; i++) {
@@ -322,11 +354,17 @@ int8_t pollActiveInput() {
   else if (activeGame == GAME_STICK) {
     int sx = analogRead(STICK_X);
     int sy = analogRead(STICK_Y);
+    int dx = sx - stickCenterX;
+    int dy = sy - stickCenterY;
 
-    if (sy > STICK_HIGH) return DIR_UP;
-    if (sy < STICK_LOW)  return DIR_DOWN;
-    if (sx < STICK_LOW)  return DIR_LEFT;
-    if (sx > STICK_HIGH) return DIR_RIGHT;
+    // Pick whichever axis moved further from the calibrated resting center
+    if (abs(dy) >= abs(dx)) {
+      if (dy >  STICK_TRIGGER_DIST) return DIR_UP;
+      if (dy < -STICK_TRIGGER_DIST) return DIR_DOWN;
+    } else {
+      if (dx < -STICK_TRIGGER_DIST) return DIR_LEFT;
+      if (dx >  STICK_TRIGGER_DIST) return DIR_RIGHT;
+    }
   } 
   else if (activeGame == GAME_BUTTONS) {
     if (digitalRead(BTN_1) == LOW) return 0;
@@ -354,6 +392,7 @@ bool runMinigameRound() {
 
   unsigned long startTime = millis();
   int lastBarWidth = 220;
+  uint16_t lastBarColor = GREEN;
   uint8_t stepIndex = 0;
 
   while (stepIndex < currentSeqLen) {
@@ -362,19 +401,39 @@ bool runMinigameRound() {
       return false; // Timed out
     }
 
-    updateTimerBar(elapsed, timeLimitMs, lastBarWidth);
+    updateTimerBar(elapsed, timeLimitMs, lastBarWidth, lastBarColor);
 
     int8_t userChoice = pollActiveInput();
     if (userChoice != -1) {
+      // Pause the game clock during the 140ms visual confirmation flash
+      // so the animation itself doesn't steal reaction time on fast Stage 5 loops
+      unsigned long flashStart = millis();
       highlightStep(userChoice, true);
       delay(140);
       highlightStep(userChoice, false);
-      waitForRelease();
+      startTime += (millis() - flashStart);
 
+      // Check immediately if the input was wrong
       if (userChoice != sequence[stepIndex]) {
-        return false; // Wrong input in sequence
+        waitForRelease();
+        return false;
       }
+
       stepIndex++;
+
+      // Wait for release while keeping the timer bar alive (unless that was the final step)
+      if (stepIndex < currentSeqLen) {
+        while (isAnyInputHeld()) {
+          unsigned long heldElapsed = millis() - startTime;
+          if (heldElapsed >= timeLimitMs) {
+            return false; // Timed out while holding input down
+          }
+          updateTimerBar(heldElapsed, timeLimitMs, lastBarWidth, lastBarColor);
+          delay(10);
+        }
+      } else {
+        waitForRelease();
+      }
     }
   }
 
@@ -385,10 +444,10 @@ void showBanner(const char* line1, const char* line2, uint16_t bgColor) {
   tft.fillScreen(bgColor);
   tft.setTextColor(WHITE);
   tft.setTextSize(3);
-  tft.setCursor(20, 110);
+  tft.setCursor(12, 110);
   tft.println(line1);
   tft.setTextSize(2);
-  tft.setCursor(20, 160);
+  tft.setCursor(12, 160);
   tft.println(line2);
   delay(1400);
 }
@@ -404,10 +463,12 @@ void resetGame() {
   generateStagePool();
 }
 
-void waitToRestart() {
+void waitToStartOrRestart() {
+  tft.setTextColor(WHITE);
   tft.setTextSize(2);
-  tft.setCursor(25, 240);
+  tft.setCursor(12, 240);
   tft.println("Press Btn 1 or Tap");
+
   while (true) {
     if (digitalRead(BTN_1) == LOW) break;
     TSPoint p = ts.getPoint();
@@ -415,6 +476,14 @@ void waitToRestart() {
     if (p.z > MINPRESSURE && p.z < MAXPRESSURE) break;
     delay(20);
   }
+
+  // On the very first boot, use the exact microsecond of the player's button/tap
+  // to seed the random number generator so every boot has unique sequences
+  if (isFirstBoot) {
+    randomSeed(micros() + analogRead(STICK_X) + analogRead(STICK_Y));
+    isFirstBoot = false;
+  }
+
   waitForRelease();
   resetGame();
 }
@@ -430,7 +499,8 @@ void setup() {
   pinMode(BTN_2, INPUT_PULLUP);
   pinMode(BTN_3, INPUT_PULLUP);
 
-  randomSeed(analogRead(STICK_X) + analogRead(STICK_Y));
+  // Calibrate slide thumbstick resting position before game starts
+  calibrateThumbstick();
 
   tft.reset();
   uint16_t identifier = tft.readID();
@@ -442,8 +512,18 @@ void setup() {
   }
 
   tft.setRotation(0);
-  resetGame();
-  showBanner("MEMORY BLITZ", "Pass 3 of 5 / Stage", BLUE);
+  tft.setTextWrap(false); // Prevent edge characters from wrapping to the next line
+
+  // Title Screen
+  tft.fillScreen(BLUE);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(12, 100);
+  tft.println("MEMORY BLITZ");
+  tft.setTextSize(2);
+  tft.setCursor(12, 150);
+  tft.println("Pass 3 of 5 Levels");
+  waitToStartOrRestart();
 }
 
 void loop() {
@@ -468,13 +548,13 @@ void loop() {
     tft.setCursor(25, 90);
     tft.println("GAME OVER!");
     tft.setTextSize(2);
-    tft.setCursor(25, 140);
+    tft.setCursor(20, 140);
     tft.print("Stage Reached: ");
     tft.println(currentStage);
-    tft.setCursor(25, 170);
+    tft.setCursor(20, 170);
     tft.print("Stage 5 Loops: ");
     tft.println(stage5Loops);
-    waitToRestart();
+    waitToStartOrRestart();
     return;
   }
 
@@ -487,7 +567,7 @@ void loop() {
 
     if (currentStage < 5) {
       currentStage++;
-      showBanner("STAGE UP!", "Difficulty Increased", BLUE);
+      showBanner("STAGE UP!", "Speed Increased!", BLUE);
     } else {
       // Cleared Stage 5! Check if flawless (0 errors across the whole run)
       if (totalErrors == 0) {
@@ -498,12 +578,12 @@ void loop() {
         tft.fillScreen(MAGENTA);
         tft.setTextColor(WHITE);
         tft.setTextSize(3);
-        tft.setCursor(15, 90);
+        tft.setCursor(12, 90);
         tft.println("FLAWLESS S5!");
         tft.setTextSize(2);
-        tft.setCursor(15, 140);
+        tft.setCursor(12, 140);
         tft.println("Repeating Stage 5");
-        tft.setCursor(15, 175);
+        tft.setCursor(12, 175);
         tft.print("New Timer: ");
         tft.print(timeLimitMs / 1000.0, 1);
         tft.println("s");
@@ -516,11 +596,11 @@ void loop() {
         tft.setCursor(25, 90);
         tft.println("YOU WIN!");
         tft.setTextSize(2);
-        tft.setCursor(25, 140);
+        tft.setCursor(15, 140);
         tft.println("Stage 5 Complete!");
-        tft.setCursor(25, 170);
-        tft.println("Go flawless for OT!");
-        waitToRestart();
+        tft.setCursor(12, 170);
+        tft.println("Go Flawless for OT");
+        waitToStartOrRestart();
       }
     }
   }
