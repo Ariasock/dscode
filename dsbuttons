@@ -36,7 +36,7 @@
 // Note: D10, D11, and D12 are all free since the SD card slot is unused.
 #define BTN_A 12  // Digital Pin D12
 #define BTN_B 11  // Digital Pin D11 
-#define BTN_X 10 // Digital Pin D10 (Unused SD Card CS pin)
+#define BTN_X 10  // Digital Pin D10 (Unused SD Card CS pin)
 
 // Slide Thumbstick (Dedicated analog inputs on A4 and A5)
 #define STICK_X A4
@@ -60,6 +60,8 @@
 #define WHITE    0xFFFF
 #define DARKGREY 0x39E7
 #define ORANGE   0xFD20
+#define PURPLE   0x780F
+#define TEAL     0x0410
 
 Elegoo_TFTLCD tft(LCD_CS, LCD_CD, LCD_WR, LCD_RD, LCD_RESET);
 TouchScreen ts = TouchScreen(XP, YP, XM, YM, 300);
@@ -113,6 +115,38 @@ uint8_t debugStartStage = 1;
 // 3. HARDWARE, EEPROM & TOUCH HELPERS
 // ==========================================
 
+// Returns the number of columns in the touch grid based on current difficulty stage
+uint8_t getTouchGridCols() {
+  if (currentStage >= 5) return 4; // Stage 5+: 2x4 grid (8 pads)
+  if (currentStage >= 3) return 3; // Stage 3-4: 2x3 grid (6 pads)
+  return 2;                        // Stage 1-2: 2x2 grid (4 pads)
+}
+
+uint8_t getTouchPadCount() {
+  return getTouchGridCols() * 2;
+}
+
+// Calculates position and dimensions for each touch pad in a 2x2, 2x3, or 2x4 grid
+void getTouchPadBounds(uint8_t index, int &x, int &y, int &w, int &h) {
+  uint8_t cols = getTouchGridCols();
+  uint8_t row = index / cols;
+  uint8_t col = index % cols;
+
+  y = (row == 0) ? 74 : 156;
+  h = 70;
+
+  if (cols == 2) {
+    w = 110;
+    x = 40 + col * 130; // x: 40, 170
+  } else if (cols == 3) {
+    w = 88;
+    x = 14 + col * 102; // x: 14, 116, 218
+  } else {
+    w = 68;
+    x = 11 + col * 76;  // x: 11, 87, 163, 239
+  }
+}
+
 // Restore shared A2/A3 pins back to OUTPUT and HIGH after reading TouchScreen
 void restoreTFTPins() {
   pinMode(XM, OUTPUT);
@@ -127,7 +161,7 @@ int readStickAnalog(uint8_t pin) {
   return analogRead(pin);
 }
 
-// Read digital state of A (D0), B (D1), or X (D10) button
+// Read digital state of A (D12), B (D11), or X (D10) button
 bool isButtonPressed(uint8_t pin) {
   return (digitalRead(pin) == LOW);
 }
@@ -337,8 +371,12 @@ void drawDebugHint(uint8_t stepIndex) {
     const char* dirNames[4] = {"NXT:UP", "NXT:DN", "NXT:LT", "NXT:RT"};
     tft.print(dirNames[target]);
   } else if (activeGame == GAME_TOUCH) {
-    const char* padNames[4] = {"PAD:TL", "PAD:TR", "PAD:BL", "PAD:BR"};
-    tft.print(padNames[target]);
+    uint8_t cols = getTouchGridCols();
+    char rChar = (target < cols) ? 'T' : 'B';
+    uint8_t cNum = (target % cols) + 1;
+    tft.print(F("PAD:"));
+    tft.print(rChar);
+    tft.print(cNum);
   } else {
     const char btnNames[3] = {'A', 'B', 'X'};
     tft.print(F("BTN: "));
@@ -368,17 +406,18 @@ void updateTimerBar(unsigned long elapsed, unsigned long limit, int &lastWidth, 
   }
 }
 
-// --- MINIGAME 1: TOUCH SCREEN (2x2 Grid in Landscape) ---
+// --- MINIGAME 1: TOUCH SCREEN (2x2 at Stg 1-2, 2x3 at Stg 3-4, 2x4 at Stg 5) ---
 void drawTouchPad(uint8_t index, bool lit) {
-  int x = (index % 2 == 0) ? 40 : 170;
-  int y = (index < 2) ? 74 : 156;
-  uint16_t baseColors[4] = {RED, BLUE, GREEN, YELLOW};
-  uint16_t drawColor = lit ? WHITE : baseColors[index];
+  int x, y, w, h;
+  getTouchPadBounds(index, x, y, w, h);
 
-  tft.fillRect(x, y, 110, 70, drawColor);
-  tft.drawRect(x, y, 110, 70, WHITE);
+  uint16_t baseColors[8] = {RED, BLUE, GREEN, YELLOW, MAGENTA, CYAN, ORANGE, PURPLE};
+  uint16_t drawColor = lit ? WHITE : baseColors[index % 8];
+
+  tft.fillRect(x, y, w, h, drawColor);
+  tft.drawRect(x, y, w, h, WHITE);
   if (lit) {
-    tft.fillRect(x + 15, y + 12, 80, 46, baseColors[index]);
+    tft.fillRect(x + 10, y + 10, w - 20, h - 20, baseColors[index % 8]);
   }
 }
 
@@ -386,9 +425,13 @@ void drawTouchBoard() {
   tft.fillRect(0, 45, 320, 195, BLACK);
   tft.setTextColor(WHITE);
   tft.setTextSize(2);
-  tft.setCursor(70, 50);
-  tft.print(F("MODE: TOUCH PAD"));
-  for (uint8_t i = 0; i < 4; i++) {
+  tft.setCursor(46, 50);
+  tft.print(F("TOUCH PAD (2x"));
+  tft.print(getTouchGridCols());
+  tft.print(F(")"));
+
+  uint8_t padCount = getTouchPadCount();
+  for (uint8_t i = 0; i < padCount; i++) {
     drawTouchPad(i, false);
   }
 }
@@ -470,7 +513,13 @@ void playSequence() {
   currentSeqLen = currentStage + 2 + stage5Loops;
   if (currentSeqLen > MAX_SEQ_LEN) currentSeqLen = MAX_SEQ_LEN;
 
-  uint8_t numOptions = (activeGame == GAME_BUTTONS) ? 3 : 4;
+  uint8_t numOptions = 4;
+  if (activeGame == GAME_BUTTONS) {
+    numOptions = 3;
+  } else if (activeGame == GAME_TOUCH) {
+    numOptions = getTouchPadCount();
+  }
+
   for (uint8_t i = 0; i < currentSeqLen; i++) {
     sequence[i] = random(0, numOptions);
   }
@@ -538,12 +587,15 @@ int8_t pollActiveInput() {
 
   if (activeGame == GAME_TOUCH) {
     if (touched) {
-      if (py >= 68 && py <= 148) {
-        if (px >= 34 && px <= 156)  return 0; // Top-Left (Red)
-        if (px >= 164 && px <= 286) return 1; // Top-Right (Blue)
-      } else if (py >= 150 && py <= 232) {
-        if (px >= 34 && px <= 156)  return 2; // Bottom-Left (Green)
-        if (px >= 164 && px <= 286) return 3; // Bottom-Right (Yellow)
+      uint8_t padCount = getTouchPadCount();
+      for (uint8_t i = 0; i < padCount; i++) {
+        int bx, by, bw, bh;
+        getTouchPadBounds(i, bx, by, bw, bh);
+        // Check touch within pad bounds (with a small 3px tolerance margin)
+        if (px >= (bx - 3) && px <= (bx + bw + 3) &&
+            py >= (by - 3) && py <= (by + bh + 3)) {
+          return i;
+        }
       }
     }
   } 
@@ -551,7 +603,7 @@ int8_t pollActiveInput() {
     return readStickDirection(touched, px, py);
   } 
   else if (activeGame == GAME_BUTTONS) {
-    // 1. Check physical buttons: A (D0), B (D1), X (D10)
+    // 1. Check physical buttons: A (D12), B (D11), X (D10)
     if (isButtonPressed(BTN_A)) return 0; // A (Green)
     if (isButtonPressed(BTN_B)) return 1; // B (Red)
     if (isButtonPressed(BTN_X)) return 2; // X (Blue)
@@ -874,12 +926,12 @@ void runDebugMenu() {
     tft.print(rawY);
     tft.print(F(")"));
 
-    // Line 3: Digital Push Buttons A (D0), B (D1), X (D10)
+    // Line 3: Digital Push Buttons A (D12), B (D11), X (D10)
     tft.setTextColor(ORANGE);
     tft.setCursor(18, 208);
-    tft.print(F("BTNS  A(D0):"));
+    tft.print(F("BTNS  A(D12):"));
     tft.print(bA ? F("ON ") : F("OFF"));
-    tft.print(F(" B(D1):"));
+    tft.print(F(" B(D11):"));
     tft.print(bB ? F("ON ") : F("OFF"));
     tft.print(F(" X(D10):"));
     tft.print(bX ? F("ON") : F("OFF"));
@@ -982,6 +1034,30 @@ void resetGame() {
   generateStagePool();
 }
 
+void showTitleScreen() {
+  tft.fillScreen(BLUE);
+  tft.drawRect(6, 6, 308, 228, WHITE);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(16, 50); // Centered for 16 chars ("Test your skill!") at size 3
+  tft.println(F("Test your skill!"));
+
+  tft.setTextSize(2);
+  tft.setCursor(45, 105);
+  tft.println(F("Pass 3 of 5 Levels"));
+
+  tft.setTextSize(1);
+  tft.setTextColor(CYAN);
+  tft.setCursor(52, 150);
+  if (EEPROM.read(EEPROM_CAL_MAGIC_ADDR) == EEPROM_CAL_MAGIC_VAL) {
+    tft.println(F("Thumbstick: CALIBRATED (Saved in EEPROM)"));
+  } else if (stickConnected) {
+    tft.println(F("Thumbstick: DETECTED (Default Cal)"));
+  } else {
+    tft.println(F("Thumbstick: UNPLUGGED (Touch Mode)"));
+  }
+}
+
 void waitToStartOrRestart() {
   tft.setTextColor(YELLOW);
   tft.setTextSize(2);
@@ -1039,8 +1115,6 @@ void waitToStartOrRestart() {
 // ==========================================
 
 void setup() {
-  // Serial.begin() is intentionally omitted so Digital Pins 0 (BTN_A) and 1 (BTN_B)
-  // are not locked by the hardware UART transceiver.
   pinMode(BTN_A, INPUT_PULLUP);
   pinMode(BTN_B, INPUT_PULLUP);
   pinMode(BTN_X, INPUT_PULLUP);
@@ -1060,29 +1134,7 @@ void setup() {
   tft.setRotation(1); // Landscape mode (320x240)
   tft.setTextWrap(false);
 
-  // Landscape Title Screen
-  tft.fillScreen(BLUE);
-  tft.drawRect(6, 6, 308, 228, WHITE);
-  tft.setTextColor(WHITE);
-  tft.setTextSize(3);
-  tft.setCursor(52, 50);
-  tft.println(F("Test your skill!"));
-
-  tft.setTextSize(2);
-  tft.setCursor(45, 105);
-  tft.println(F("Pass 3 of 5 Levels"));
-
-  tft.setTextSize(1);
-  tft.setTextColor(CYAN);
-  tft.setCursor(52, 150);
-  if (EEPROM.read(EEPROM_CAL_MAGIC_ADDR) == EEPROM_CAL_MAGIC_VAL) {
-    tft.println(F("Thumbstick: CALIBRATED (Saved in EEPROM)"));
-  } else if (stickConnected) {
-    tft.println(F("Thumbstick: DETECTED (Default Cal)"));
-  } else {
-    tft.println(F("Thumbstick: UNPLUGGED (Touch Mode)"));
-  }
-
+  showTitleScreen();
   waitToStartOrRestart();
 }
 
