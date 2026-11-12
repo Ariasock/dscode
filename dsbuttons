@@ -1,6 +1,7 @@
 #include <Elegoo_GFX.h>    // Core graphics library
 #include <Elegoo_TFTLCD.h> // Hardware-specific library
 #include <TouchScreen.h>   // Touch library
+#include <EEPROM.h>        // Saves thumbstick calibration across power cycles
 
 // ==========================================
 // 1. PIN DEFINITIONS & ORIENTATION SETTINGS
@@ -31,17 +32,22 @@
 #define INVERT_TOUCH_X true
 #define INVERT_TOUCH_Y true
 
-// 3 Momentary Push Buttons (Wired between pin and GND)
-#define BTN_1 10
-#define BTN_2 11
-#define BTN_3 12
+// 3 Momentary Push Buttons: A (Green), B (Red), X (Blue) (Wired between pin and GND)
+// Note: D10, D11, and D12 are all free since the SD card slot is unused.
+#define BTN_A 12  // Digital Pin D12
+#define BTN_B 11  // Digital Pin D11 
+#define BTN_X 10 // Digital Pin D10 (Unused SD Card CS pin)
 
-// Slide Thumbstick (Analog inputs on A4 and A5)
+// Slide Thumbstick (Dedicated analog inputs on A4 and A5)
 #define STICK_X A4
 #define STICK_Y A5
 
-#define STICK_TRIGGER_DIST 180 // Distance from center needed to register a slide
-#define STICK_RELEASE_DIST 110 // Distance from center considered back at rest
+#define STICK_MIN_MOVE     90  // Minimum analog delta from center during calibration
+#define STICK_RELEASE_DIST 85  // Distance from center considered back at rest
+
+// EEPROM storage address for saved thumbstick calibration
+#define EEPROM_CAL_MAGIC_ADDR 0
+#define EEPROM_CAL_MAGIC_VAL  0xB7
 
 // 16-bit RGB565 Color Definitions
 #define BLACK    0x0000
@@ -91,6 +97,10 @@ bool stickConnected = false;
 int stickCenterX = 512;
 int stickCenterY = 512;
 
+// Recorded analog (X, Y) coordinates for UP, DOWN, LEFT, RIGHT pushes
+int calTargetX[4] = {512, 750, 270, 512};
+int calTargetY[4] = {750, 512, 512, 270};
+
 // Secret Debug Mode Variables
 // debugForceMode: -1 = All (Normal), 0 = Touch Only, 1 = Stick Only, 2 = Buttons Only
 int8_t debugForceMode = -1;
@@ -100,7 +110,7 @@ uint8_t debugCheatLevel = 0;
 uint8_t debugStartStage = 1;
 
 // ==========================================
-// 3. HARDWARE & TOUCH HELPERS
+// 3. HARDWARE, EEPROM & TOUCH HELPERS
 // ==========================================
 
 // Restore shared A2/A3 pins back to OUTPUT and HIGH after reading TouchScreen
@@ -111,19 +121,52 @@ void restoreTFTPins() {
   digitalWrite(YP, HIGH);
 }
 
-// Read clean analog value (discards first sample to prevent ADC mux ghosting from A2/A3)
-int readCleanAnalog(uint8_t pin) {
+// Read clean analog value from thumbstick (discards first sample to prevent ADC mux ghosting)
+int readStickAnalog(uint8_t pin) {
   analogRead(pin);
   return analogRead(pin);
 }
 
-// Auto-detect if the slide thumbstick is wired up, and calibrate its resting center
-void calibrateThumbstick() {
+// Read digital state of A (D0), B (D1), or X (D10) button
+bool isButtonPressed(uint8_t pin) {
+  return (digitalRead(pin) == LOW);
+}
+
+// Save calibrated thumbstick parameters to EEPROM
+void saveStickCalibrationEEPROM() {
+  int addr = EEPROM_CAL_MAGIC_ADDR;
+  EEPROM.update(addr, EEPROM_CAL_MAGIC_VAL);
+  addr += 1;
+  EEPROM.put(addr, stickCenterX); addr += sizeof(int);
+  EEPROM.put(addr, stickCenterY); addr += sizeof(int);
+  for (uint8_t d = 0; d < 4; d++) {
+    EEPROM.put(addr, calTargetX[d]); addr += sizeof(int);
+    EEPROM.put(addr, calTargetY[d]); addr += sizeof(int);
+  }
+}
+
+// Load calibrated thumbstick parameters from EEPROM if previously saved
+bool loadStickCalibrationEEPROM() {
+  if (EEPROM.read(EEPROM_CAL_MAGIC_ADDR) != EEPROM_CAL_MAGIC_VAL) {
+    return false;
+  }
+  int addr = EEPROM_CAL_MAGIC_ADDR + 1;
+  EEPROM.get(addr, stickCenterX); addr += sizeof(int);
+  EEPROM.get(addr, stickCenterY); addr += sizeof(int);
+  for (uint8_t d = 0; d < 4; d++) {
+    EEPROM.get(addr, calTargetX[d]); addr += sizeof(int);
+    EEPROM.get(addr, calTargetY[d]); addr += sizeof(int);
+  }
+  return true;
+}
+
+// Auto-detect if the slide thumbstick is wired up, and load or calibrate center
+void initThumbstick() {
   pinMode(STICK_X, INPUT_PULLUP);
   pinMode(STICK_Y, INPUT_PULLUP);
   delay(5);
-  int testX = readCleanAnalog(STICK_X);
-  int testY = readCleanAnalog(STICK_Y);
+  int testX = readStickAnalog(STICK_X);
+  int testY = readStickAnalog(STICK_Y);
 
   pinMode(STICK_X, INPUT);
   pinMode(STICK_Y, INPUT);
@@ -131,22 +174,40 @@ void calibrateThumbstick() {
 
   if (testX > 960 && testY > 960) {
     stickConnected = false; // Pins are floating (unplugged)
-    return;
+  } else {
+    stickConnected = true;
   }
 
-  stickConnected = true;
-  long sumX = 0;
-  long sumY = 0;
-  for (uint8_t i = 0; i < 16; i++) {
-    sumX += readCleanAnalog(STICK_X);
-    sumY += readCleanAnalog(STICK_Y);
-    delay(3);
-  }
-  stickCenterX = sumX / 16;
-  stickCenterY = sumY / 16;
+  // Load saved directional vectors if available
+  bool hadSaved = loadStickCalibrationEEPROM();
 
-  if (stickCenterX < 300 || stickCenterX > 720) stickCenterX = 512;
-  if (stickCenterY < 300 || stickCenterY > 720) stickCenterY = 512;
+  // If stick is physically connected right now, refresh resting center
+  if (stickConnected) {
+    long sumX = 0, sumY = 0;
+    for (uint8_t i = 0; i < 16; i++) {
+      sumX += readStickAnalog(STICK_X);
+      sumY += readStickAnalog(STICK_Y);
+      delay(3);
+    }
+    int liveCX = sumX / 16;
+    int liveCY = sumY / 16;
+
+    if (liveCX >= 250 && liveCX <= 770 && liveCY >= 250 && liveCY <= 770) {
+      if (!hadSaved) {
+        stickCenterX = liveCX;
+        stickCenterY = liveCY;
+        // Default directional targets relative to center (with Right/Down matched)
+        calTargetX[DIR_UP]    = stickCenterX;
+        calTargetY[DIR_UP]    = stickCenterY + 240;
+        calTargetX[DIR_DOWN]  = stickCenterX + 240;
+        calTargetY[DIR_DOWN]  = stickCenterY;
+        calTargetX[DIR_LEFT]  = stickCenterX - 240;
+        calTargetY[DIR_LEFT]  = stickCenterY;
+        calTargetX[DIR_RIGHT] = stickCenterX;
+        calTargetY[DIR_RIGHT] = stickCenterY - 240;
+      }
+    }
+  }
 }
 
 // Read touch screen and map coordinates to Landscape (320x240)
@@ -184,13 +245,13 @@ bool getLandscapeTouch(int &px, int &py) {
 
 // Check if any active input is currently held down
 bool isAnyInputHeld() {
-  if (digitalRead(BTN_1) == LOW || digitalRead(BTN_2) == LOW || digitalRead(BTN_3) == LOW) {
+  if (isButtonPressed(BTN_A) || isButtonPressed(BTN_B) || isButtonPressed(BTN_X)) {
     return true;
   }
 
   if (stickConnected) {
-    int dx = abs(readCleanAnalog(STICK_X) - stickCenterX);
-    int dy = abs(readCleanAnalog(STICK_Y) - stickCenterY);
+    int dx = abs(readStickAnalog(STICK_X) - stickCenterX);
+    int dy = abs(readStickAnalog(STICK_Y) - stickCenterY);
     if (dx > STICK_RELEASE_DIST || dy > STICK_RELEASE_DIST) {
       return true;
     }
@@ -204,7 +265,6 @@ bool isAnyInputHeld() {
   return false;
 }
 
-// Wait until buttons are unpressed, thumbstick is centered, and screen is untouched
 void waitForRelease() {
   while (isAnyInputHeld()) {
     delay(15);
@@ -260,12 +320,10 @@ void drawHUD() {
   tft.print(levelInStage + 1);
   tft.print(F("/5"));
 
-  // Landscape Timer bar frame (300px inner width)
   tft.drawRect(8, 26, 304, 12, WHITE);
   tft.fillRect(10, 28, 300, 8, GREEN);
 }
 
-// Draw live next-step hint in HUD if Debug Hints or God Mode is enabled
 void drawDebugHint(uint8_t stepIndex) {
   if (debugCheatLevel == 0) return;
 
@@ -282,8 +340,9 @@ void drawDebugHint(uint8_t stepIndex) {
     const char* padNames[4] = {"PAD:TL", "PAD:TR", "PAD:BL", "PAD:BR"};
     tft.print(padNames[target]);
   } else {
-    tft.print(F("BTN: #"));
-    tft.print(target + 1);
+    const char btnNames[3] = {'A', 'B', 'X'};
+    tft.print(F("BTN: "));
+    tft.print(btnNames[target]);
   }
 }
 
@@ -365,28 +424,33 @@ void drawStickBoard() {
   }
 }
 
-// --- MINIGAME 3: 3 PUSH BUTTONS (in Landscape) ---
+// --- MINIGAME 3: 3 PUSH BUTTONS: A (Green), B (Red), X (Blue) ---
 void drawButtonIcon(uint8_t index, bool lit) {
   int x = 65 + (index * 95);
   int y = 152;
-  uint16_t baseColors[3] = {MAGENTA, CYAN, ORANGE};
+  uint16_t baseColors[3] = {GREEN, RED, BLUE};
+  const char labels[3] = {'A', 'B', 'X'};
   uint16_t color = lit ? WHITE : baseColors[index];
 
   tft.fillCircle(x, y, 34, color);
   tft.drawCircle(x, y, 34, WHITE);
 
-  tft.setTextColor(BLACK);
-  tft.setTextSize(2);
-  tft.setCursor(x - 6, y - 7);
-  tft.print(index + 1);
+  if (lit || index == 0) {
+    tft.setTextColor(BLACK);
+  } else {
+    tft.setTextColor(WHITE);
+  }
+  tft.setTextSize(3);
+  tft.setCursor(x - 8, y - 10);
+  tft.print(labels[index]);
 }
 
 void drawButtonBoard() {
   tft.fillRect(0, 45, 320, 195, BLACK);
   tft.setTextColor(ORANGE);
   tft.setTextSize(2);
-  tft.setCursor(70, 50);
-  tft.print(F("MODE: 3 BUTTONS"));
+  tft.setCursor(46, 50);
+  tft.print(F("BUTTONS: A / B / X"));
   for (uint8_t i = 0; i < 3; i++) {
     drawButtonIcon(i, false);
   }
@@ -423,30 +487,46 @@ void playSequence() {
   }
 }
 
-// Reads thumbstick direction (with RIGHT and DOWN swapped to match your hardware/screen)
+// Evaluates thumbstick direction using the calibrated target vectors for UP, DOWN, LEFT, RIGHT
 int8_t readStickDirection(bool touched, int px, int py) {
-  // 1. Check physical slide thumbstick if it is wired up
   if (stickConnected) {
-    int sx = readCleanAnalog(STICK_X);
-    int sy = readCleanAnalog(STICK_Y);
-    int dx = sx - stickCenterX;
-    int dy = sy - stickCenterY;
+    int sx = readStickAnalog(STICK_X);
+    int sy = readStickAnalog(STICK_Y);
+    long dx = sx - stickCenterX;
+    long dy = sy - stickCenterY;
 
-    if (abs(dy) >= abs(dx)) {
-      if (dy >  STICK_TRIGGER_DIST) return DIR_UP;
-      if (dy < -STICK_TRIGGER_DIST) return DIR_RIGHT; // Swapped: was DIR_DOWN
-    } else {
-      if (dx < -STICK_TRIGGER_DIST) return DIR_LEFT;
-      if (dx >  STICK_TRIGGER_DIST) return DIR_DOWN;  // Swapped: was DIR_RIGHT
+    if (abs(dx) > STICK_RELEASE_DIST || abs(dy) > STICK_RELEASE_DIST) {
+      int8_t bestDir = -1;
+      long bestScore = 55; // Must reach at least 55% of calibrated throw in that direction
+
+      for (uint8_t d = 0; d < 4; d++) {
+        long vx = calTargetX[d] - stickCenterX;
+        long vy = calTargetY[d] - stickCenterY;
+        long magSq = (vx * vx) + (vy * vy);
+        if (magSq < 2500) continue;
+
+        long dot = (dx * vx) + (dy * vy);
+        if (dot > 0) {
+          long pct = (dot * 100L) / magSq;
+          if (pct > bestScore) {
+            bestScore = pct;
+            bestDir = d;
+          }
+        }
+      }
+
+      if (bestDir != -1) {
+        return bestDir;
+      }
     }
   }
 
-  // 2. Touchscreen fallback (also with RIGHT and DOWN swapped)
+  // Touchscreen fallback (with Right and Down matched to your panel)
   if (touched) {
     if (px >= 120 && px <= 200 && py >= 68 && py <= 122)  return DIR_UP;
-    if (px >= 120 && px <= 200 && py >= 182 && py <= 236) return DIR_RIGHT; // Swapped: was DIR_DOWN
+    if (px >= 120 && px <= 200 && py >= 182 && py <= 236) return DIR_RIGHT;
     if (px >= 55 && px <= 122 && py >= 118 && py <= 186)  return DIR_LEFT;
-    if (px >= 198 && px <= 265 && py >= 118 && py <= 186) return DIR_DOWN;  // Swapped: was DIR_RIGHT
+    if (px >= 198 && px <= 265 && py >= 118 && py <= 186) return DIR_DOWN;
   }
 
   return -1;
@@ -471,14 +551,16 @@ int8_t pollActiveInput() {
     return readStickDirection(touched, px, py);
   } 
   else if (activeGame == GAME_BUTTONS) {
-    if (digitalRead(BTN_1) == LOW) return 0;
-    if (digitalRead(BTN_2) == LOW) return 1;
-    if (digitalRead(BTN_3) == LOW) return 2;
+    // 1. Check physical buttons: A (D0), B (D1), X (D10)
+    if (isButtonPressed(BTN_A)) return 0; // A (Green)
+    if (isButtonPressed(BTN_B)) return 1; // B (Red)
+    if (isButtonPressed(BTN_X)) return 2; // X (Blue)
 
+    // 2. Touchscreen fallback on A, B, X circles
     if (touched && py >= 112 && py <= 192) {
-      if (px >= 25 && px <= 105)  return 0; // Button 1
-      if (px >= 120 && px <= 200) return 1; // Button 2
-      if (px >= 215 && px <= 295) return 2; // Button 3
+      if (px >= 25 && px <= 105)  return 0; // Button A
+      if (px >= 120 && px <= 200) return 1; // Button B
+      if (px >= 215 && px <= 295) return 2; // Button X
     }
   }
 
@@ -486,16 +568,174 @@ int8_t pollActiveInput() {
 }
 
 // ==========================================
-// 6. SECRET DEBUG MENU
+// 6. INTERACTIVE THUMBSTICK CALIBRATION & DEBUG MENU
 // ==========================================
 
-void drawDebugButtons() {
-  // Button 1: Stage Selector (Top-Left)
-  tft.fillRect(10, 32, 145, 48, BLUE);
-  tft.drawRect(10, 32, 145, 48, WHITE);
+void runStickCalibrationWizard() {
+  tft.fillScreen(BLACK);
+  tft.fillRect(0, 0, 275, 26, CYAN);
+  tft.setTextColor(BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(8, 5);
+  tft.print(F("STICK CALIBRATION"));
+
+  // Cancel button in top-right corner in case thumbstick isn't wired
+  tft.fillRect(278, 0, 42, 26, RED);
+  tft.drawRect(278, 0, 42, 26, WHITE);
+  tft.setTextColor(WHITE);
+  tft.setCursor(286, 5);
+  tft.print(F("[X]"));
+
+  waitForRelease();
+
+  // --- STEP 1: RECORD CENTER ---
+  tft.setTextColor(YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(20, 40);
+  tft.print(F("1/5: HANDS OFF STICK"));
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(20, 64);
+  tft.print(F("Measuring resting center position..."));
+
+  long sumCX = 0, sumCY = 0;
+  for (uint8_t i = 0; i < 24; i++) {
+    int px, py;
+    if (getLandscapeTouch(px, py) && px >= 270 && py <= 35) return; // Cancelled
+    sumCX += readStickAnalog(STICK_X);
+    sumCY += readStickAnalog(STICK_Y);
+    tft.fillRect(40, 82, i * 10, 8, GREEN);
+    delay(25);
+  }
+  stickCenterX = sumCX / 24;
+  stickCenterY = sumCY / 24;
+
+  // --- STEPS 2 TO 5: RECORD UP, DOWN, LEFT, RIGHT ---
+  const char* stepTitles[4] = {
+    "2/5: PUSH & HOLD UP",
+    "3/5: PUSH & HOLD DOWN",
+    "4/5: PUSH & HOLD LEFT",
+    "5/5: PUSH & HOLD RIGHT"
+  };
+
+  for (uint8_t d = 0; d < 4; d++) {
+    tft.fillRect(0, 30, 320, 210, BLACK);
+
+    tft.fillCircle(160, 152, 12, DARKGREY);
+    for (uint8_t a = 0; a < 4; a++) {
+      drawStickArrow(a, (a == d));
+    }
+
+    tft.setTextColor(YELLOW);
+    tft.setTextSize(2);
+    tft.setCursor(16, 34);
+    tft.print(stepTitles[d]);
+
+    while (true) {
+      int px, py;
+      if (getLandscapeTouch(px, py) && px >= 270 && py <= 35) return; // Cancelled
+
+      int sx = readStickAnalog(STICK_X);
+      int sy = readStickAnalog(STICK_Y);
+      int dx = sx - stickCenterX;
+      int dy = sy - stickCenterY;
+
+      tft.fillRect(0, 54, 270, 14, BLACK);
+      tft.setTextColor(CYAN);
+      tft.setTextSize(1);
+      tft.setCursor(16, 56);
+      tft.print(F("Live X:"));
+      tft.print(sx);
+      tft.print(F(" Y:"));
+      tft.print(sy);
+      tft.print(F(" (dX:"));
+      tft.print(dx);
+      tft.print(F(" dY:"));
+      tft.print(dy);
+      tft.print(F(")"));
+
+      if (abs(dx) >= STICK_MIN_MOVE || abs(dy) >= STICK_MIN_MOVE) {
+        long accX = 0, accY = 0;
+        bool heldSteady = true;
+        for (uint8_t s = 0; s < 16; s++) {
+          int rx = readStickAnalog(STICK_X);
+          int ry = readStickAnalog(STICK_Y);
+          if (abs(rx - stickCenterX) < (STICK_MIN_MOVE - 20) &&
+              abs(ry - stickCenterY) < (STICK_MIN_MOVE - 20)) {
+            heldSteady = false;
+            break;
+          }
+          accX += rx;
+          accY += ry;
+          delay(15);
+        }
+
+        if (heldSteady) {
+          calTargetX[d] = accX / 16;
+          calTargetY[d] = accY / 16;
+          break;
+        }
+      }
+      delay(25);
+    }
+
+    tft.fillRect(0, 32, 275, 36, BLACK);
+    tft.setTextColor(GREEN);
+    tft.setTextSize(2);
+    tft.setCursor(16, 34);
+    tft.print(F("CAPTURED! ("));
+    tft.print(calTargetX[d]);
+    tft.print(F(","));
+    tft.print(calTargetY[d]);
+    tft.print(F(")"));
+
+    tft.setTextColor(WHITE);
+    tft.setTextSize(1);
+    tft.setCursor(16, 56);
+    tft.print(F("Release thumbstick back to center..."));
+
+    while (true) {
+      int px, py;
+      if (getLandscapeTouch(px, py) && px >= 270 && py <= 35) return;
+
+      int sx = readStickAnalog(STICK_X);
+      int sy = readStickAnalog(STICK_Y);
+      if (abs(sx - stickCenterX) < STICK_RELEASE_DIST &&
+          abs(sy - stickCenterY) < STICK_RELEASE_DIST) {
+        break;
+      }
+      delay(20);
+    }
+    delay(200);
+  }
+
+  stickConnected = true;
+  saveStickCalibrationEEPROM();
+
+  tft.fillScreen(GREEN);
+  tft.setTextColor(BLACK);
+  tft.setTextSize(3);
+  tft.setCursor(30, 85);
+  tft.print(F("CALIBRATED!"));
+  tft.setTextSize(2);
+  tft.setCursor(35, 135);
+  tft.print(F("Saved to Memory"));
+  delay(1200);
+}
+
+void drawDebugMenuScreen() {
+  tft.fillScreen(BLACK);
+  tft.fillRect(0, 0, 320, 24, MAGENTA);
   tft.setTextColor(WHITE);
   tft.setTextSize(2);
-  tft.setCursor(18, 48);
+  tft.setCursor(45, 4);
+  tft.print(F("SECRET DEBUG MODE"));
+
+  // Row 1 Left: Stage Selector (y: 28..68)
+  tft.fillRect(10, 28, 145, 40, BLUE);
+  tft.drawRect(10, 28, 145, 40, WHITE);
+  tft.setTextColor(WHITE);
+  tft.setCursor(18, 40);
   tft.print(F("STG: "));
   if (debugStartStage <= 5) {
     tft.print(debugStartStage);
@@ -504,51 +744,46 @@ void drawDebugButtons() {
     tft.print(F("5+OT"));
   }
 
-  // Button 2: Force Mode Selector (Top-Right)
-  tft.fillRect(165, 32, 145, 48, DARKGREY);
-  tft.drawRect(165, 32, 145, 48, WHITE);
+  // Row 1 Right: Force Mode Selector (y: 28..68)
+  tft.fillRect(165, 28, 145, 40, DARKGREY);
+  tft.drawRect(165, 28, 145, 40, WHITE);
   tft.setTextColor(CYAN);
-  tft.setCursor(173, 48);
+  tft.setCursor(173, 40);
   if (debugForceMode == -1)     tft.print(F("MODE: ALL"));
   else if (debugForceMode == 0) tft.print(F("MODE: TCH"));
   else if (debugForceMode == 1) tft.print(F("MODE: STK"));
   else if (debugForceMode == 2) tft.print(F("MODE: BTN"));
 
-  // Button 3: Cheat / God Mode Toggle (Mid-Left)
+  // Row 2 Left: Cheat / God Mode Toggle (y: 74..114)
   uint16_t cheatBg = (debugCheatLevel == 0) ? DARKGREY : (debugCheatLevel == 1 ? MAGENTA : ORANGE);
-  tft.fillRect(10, 88, 145, 48, cheatBg);
-  tft.drawRect(10, 88, 145, 48, WHITE);
+  tft.fillRect(10, 74, 145, 40, cheatBg);
+  tft.drawRect(10, 74, 145, 40, WHITE);
   tft.setTextColor(WHITE);
-  tft.setCursor(18, 104);
+  tft.setCursor(18, 86);
   if (debugCheatLevel == 0)      tft.print(F("CHT: OFF"));
   else if (debugCheatLevel == 1) tft.print(F("CHT: HINT"));
   else                           tft.print(F("CHT: GOD"));
 
-  // Button 4: Start Game (Mid-Right)
-  tft.fillRect(165, 88, 145, 48, GREEN);
-  tft.drawRect(165, 88, 145, 48, WHITE);
+  // Row 2 Right: Interactive Thumbstick Calibration Button (y: 74..114)
+  tft.fillRect(165, 74, 145, 40, YELLOW);
+  tft.drawRect(165, 74, 145, 40, WHITE);
   tft.setTextColor(BLACK);
-  tft.setCursor(178, 104);
-  tft.print(F("START >>"));
+  tft.setCursor(173, 86);
+  tft.print(F("CAL STICK"));
+
+  // Row 3 Full Width: Start Game Button (y: 120..154)
+  tft.fillRect(10, 120, 300, 34, GREEN);
+  tft.drawRect(10, 120, 300, 34, WHITE);
+  tft.setTextColor(BLACK);
+  tft.setCursor(92, 129);
+  tft.print(F("START GAME >>"));
+
+  // Live Hardware Inspector Box (y: 160..236)
+  tft.drawRect(10, 160, 300, 76, WHITE);
 }
 
 void runDebugMenu() {
-  tft.fillScreen(BLACK);
-  tft.fillRect(0, 0, 320, 26, MAGENTA);
-  tft.setTextColor(WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(45, 5);
-  tft.print(F("SECRET DEBUG MODE"));
-
-  drawDebugButtons();
-
-  // Live Hardware Inspector Box
-  tft.drawRect(10, 144, 300, 90, WHITE);
-  tft.setTextSize(1);
-  tft.setTextColor(YELLOW);
-  tft.setCursor(18, 150);
-  tft.print(F("LIVE INPUT MONITOR (Touch anywhere to test):"));
-
+  drawDebugMenuScreen();
   waitForRelease();
 
   int lastCrossX = -1;
@@ -558,26 +793,7 @@ void runDebugMenu() {
     int px = 0, py = 0, rawX = 0, rawY = 0;
     bool touched = getLandscapeTouchRaw(px, py, rawX, rawY);
 
-    // Physical Button Shortcuts inside Debug Menu
-    if (digitalRead(BTN_1) == LOW) {
-      waitForRelease();
-      break; // Start Game
-    }
-    if (digitalRead(BTN_2) == LOW) {
-      debugForceMode++;
-      if (debugForceMode > 2) debugForceMode = -1;
-      drawDebugButtons();
-      waitForRelease();
-    }
-    if (digitalRead(BTN_3) == LOW) {
-      debugCheatLevel = (debugCheatLevel + 1) % 3;
-      drawDebugButtons();
-      waitForRelease();
-    }
-
-    // Check Touch Buttons
     if (touched) {
-      // Draw a live yellow crosshair dot where the touch registered
       if (lastCrossX != -1) {
         tft.fillCircle(lastCrossX, lastCrossY, 3, BLACK);
       }
@@ -585,46 +801,60 @@ void runDebugMenu() {
       lastCrossX = px;
       lastCrossY = py;
 
-      if (py >= 32 && py <= 80) {
+      // Row 1 Buttons (y: 28..68)
+      if (py >= 28 && py <= 68) {
         if (px >= 10 && px <= 155) {
           debugStartStage++;
           if (debugStartStage > 6) debugStartStage = 1;
-          drawDebugButtons();
+          drawDebugMenuScreen();
           waitForRelease();
         } else if (px >= 165 && px <= 310) {
           debugForceMode++;
           if (debugForceMode > 2) debugForceMode = -1;
-          drawDebugButtons();
+          drawDebugMenuScreen();
           waitForRelease();
         }
-      } else if (py >= 88 && py <= 136) {
+      }
+      // Row 2 Buttons (y: 74..114)
+      else if (py >= 74 && py <= 114) {
         if (px >= 10 && px <= 155) {
           debugCheatLevel = (debugCheatLevel + 1) % 3;
-          drawDebugButtons();
+          drawDebugMenuScreen();
           waitForRelease();
         } else if (px >= 165 && px <= 310) {
           waitForRelease();
-          break; // Exit Debug Menu & Start Game
+          runStickCalibrationWizard();
+          drawDebugMenuScreen();
+          waitForRelease();
         }
+      }
+      // Row 3 Start Button (y: 120..154)
+      else if (py >= 120 && py <= 154 && px >= 10 && px <= 310) {
+        waitForRelease();
+        break; // Exit Debug Menu & Start Game
       }
     }
 
-    // Update Live Hardware Readout every frame
-    int sx = readCleanAnalog(STICK_X);
-    int sy = readCleanAnalog(STICK_Y);
+    // Update Live Hardware Readout inside bottom box
+    int sx = readStickAnalog(STICK_X);
+    int sy = readStickAnalog(STICK_Y);
     int8_t sDir = readStickDirection(touched, px, py);
 
-    tft.fillRect(16, 164, 288, 64, BLACK);
+    bool bA = isButtonPressed(BTN_A);
+    bool bB = isButtonPressed(BTN_B);
+    bool bX = isButtonPressed(BTN_X);
+
+    tft.fillRect(14, 164, 292, 68, BLACK);
     tft.setTextSize(1);
 
-    // Line 1: Thumbstick values & direction
+    // Line 1: Thumbstick values & calibrated direction
     tft.setTextColor(CYAN);
-    tft.setCursor(18, 166);
-    tft.print(F("STICK A4(X):"));
+    tft.setCursor(18, 168);
+    tft.print(F("STICK X:"));
     tft.print(sx);
-    tft.print(F(" A5(Y):"));
+    tft.print(F(" Y:"));
     tft.print(sy);
-    tft.print(F(" Dir:"));
+    tft.print(F(" CalDir:"));
     if (sDir == DIR_UP)         tft.print(F("UP"));
     else if (sDir == DIR_DOWN)  tft.print(F("DOWN"));
     else if (sDir == DIR_LEFT)  tft.print(F("LEFT"));
@@ -633,7 +863,7 @@ void runDebugMenu() {
 
     // Line 2: Touch Screen raw & mapped coordinates
     tft.setTextColor(GREEN);
-    tft.setCursor(18, 184);
+    tft.setCursor(18, 188);
     tft.print(F("TOUCH px:"));
     tft.print(px);
     tft.print(F(" py:"));
@@ -644,15 +874,15 @@ void runDebugMenu() {
     tft.print(rawY);
     tft.print(F(")"));
 
-    // Line 3: Digital Push Buttons
+    // Line 3: Digital Push Buttons A (D0), B (D1), X (D10)
     tft.setTextColor(ORANGE);
-    tft.setCursor(18, 202);
-    tft.print(F("BTNS  D10:"));
-    tft.print(digitalRead(BTN_1) == LOW ? F("ON ") : F("OFF"));
-    tft.print(F(" D11:"));
-    tft.print(digitalRead(BTN_2) == LOW ? F("ON ") : F("OFF"));
-    tft.print(F(" D12:"));
-    tft.print(digitalRead(BTN_3) == LOW ? F("ON") : F("OFF"));
+    tft.setCursor(18, 208);
+    tft.print(F("BTNS  A(D0):"));
+    tft.print(bA ? F("ON ") : F("OFF"));
+    tft.print(F(" B(D1):"));
+    tft.print(bB ? F("ON ") : F("OFF"));
+    tft.print(F(" X(D10):"));
+    tft.print(bX ? F("ON") : F("OFF"));
 
     delay(40);
   }
@@ -756,7 +986,7 @@ void waitToStartOrRestart() {
   tft.setTextColor(YELLOW);
   tft.setTextSize(2);
   tft.setCursor(45, 192);
-  tft.println(F("Press Btn 1 or Tap"));
+  tft.println(F("Press Btn A or Tap"));
 
   tft.setTextColor(WHITE);
   tft.setTextSize(1);
@@ -766,10 +996,9 @@ void waitToStartOrRestart() {
   bool openDebug = false;
 
   while (true) {
-    if (digitalRead(BTN_1) == LOW) break;
+    if (isButtonPressed(BTN_A)) break;
 
-    // Pressing Button 2 or Button 3 opens Secret Debug Mode immediately
-    if (digitalRead(BTN_2) == LOW || digitalRead(BTN_3) == LOW) {
+    if (isButtonPressed(BTN_B) || isButtonPressed(BTN_X)) {
       openDebug = true;
       break;
     }
@@ -777,7 +1006,6 @@ void waitToStartOrRestart() {
     int px, py;
     if (getLandscapeTouch(px, py)) {
       unsigned long holdStart = millis();
-      // Measure how long the player holds their finger on the screen
       while (getLandscapeTouch(px, py)) {
         unsigned long heldMs = millis() - holdStart;
         int barW = map(constrain(heldMs, 0, 1200), 0, 1200, 0, 200);
@@ -789,7 +1017,7 @@ void waitToStartOrRestart() {
         }
         delay(20);
       }
-      break; // Quick tap starts game; 1.2s hold opens Debug Menu
+      break;
     }
     delay(20);
   }
@@ -811,14 +1039,14 @@ void waitToStartOrRestart() {
 // ==========================================
 
 void setup() {
-  Serial.begin(9600);
+  // Serial.begin() is intentionally omitted so Digital Pins 0 (BTN_A) and 1 (BTN_B)
+  // are not locked by the hardware UART transceiver.
+  pinMode(BTN_A, INPUT_PULLUP);
+  pinMode(BTN_B, INPUT_PULLUP);
+  pinMode(BTN_X, INPUT_PULLUP);
 
-  pinMode(BTN_1, INPUT_PULLUP);
-  pinMode(BTN_2, INPUT_PULLUP);
-  pinMode(BTN_3, INPUT_PULLUP);
-
-  // Detect if thumbstick is wired up and calibrate center
-  calibrateThumbstick();
+  // Detect thumbstick and load saved EEPROM calibration if present
+  initThumbstick();
 
   tft.reset();
   uint16_t identifier = tft.readID();
@@ -838,18 +1066,19 @@ void setup() {
   tft.setTextColor(WHITE);
   tft.setTextSize(3);
   tft.setCursor(52, 50);
-  tft.println(F("MEMORY BLITZ"));
+  tft.println(F("Test your skill!"));
 
   tft.setTextSize(2);
   tft.setCursor(45, 105);
   tft.println(F("Pass 3 of 5 Levels"));
 
-  // Shows hardware detection status right on the title screen
   tft.setTextSize(1);
   tft.setTextColor(CYAN);
-  tft.setCursor(65, 150);
-  if (stickConnected) {
-    tft.println(F("Thumbstick: DETECTED (A4/A5)"));
+  tft.setCursor(52, 150);
+  if (EEPROM.read(EEPROM_CAL_MAGIC_ADDR) == EEPROM_CAL_MAGIC_VAL) {
+    tft.println(F("Thumbstick: CALIBRATED (Saved in EEPROM)"));
+  } else if (stickConnected) {
+    tft.println(F("Thumbstick: DETECTED (Default Cal)"));
   } else {
     tft.println(F("Thumbstick: UNPLUGGED (Touch Mode)"));
   }
