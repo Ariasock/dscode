@@ -27,10 +27,7 @@
 #define MINPRESSURE 10
 #define MAXPRESSURE 1000
 
-// Landscape Touch Axis Toggles:
-// Based on your test (Top-Right registering as Bottom-Right in portrait),
-// these are set for Landscape (setRotation(1)). If an axis feels mirrored
-// depending on which way you hold the landscape screen, flip true/false here:
+// Landscape Touch Axis Toggles
 #define INVERT_TOUCH_X true
 #define INVERT_TOUCH_Y true
 
@@ -94,6 +91,14 @@ bool stickConnected = false;
 int stickCenterX = 512;
 int stickCenterY = 512;
 
+// Secret Debug Mode Variables
+// debugForceMode: -1 = All (Normal), 0 = Touch Only, 1 = Stick Only, 2 = Buttons Only
+int8_t debugForceMode = -1;
+// debugCheatLevel: 0 = Off, 1 = Show HUD Sequence Hints, 2 = God Mode (No Fail + Hints)
+uint8_t debugCheatLevel = 0;
+// debugStartStage: 1 to 5 = Stage 1-5, 6 = Stage 5 Overtime Loop 1
+uint8_t debugStartStage = 1;
+
 // ==========================================
 // 3. HARDWARE & TOUCH HELPERS
 // ==========================================
@@ -114,9 +119,6 @@ int readCleanAnalog(uint8_t pin) {
 
 // Auto-detect if the slide thumbstick is wired up, and calibrate its resting center
 void calibrateThumbstick() {
-  // Briefly enable internal pull-ups on A4/A5.
-  // If nothing is wired up, both floating pins immediately pull up near 1023.
-  // If a 10k slide pot is wired up, it holds the pins near center (~512-560).
   pinMode(STICK_X, INPUT_PULLUP);
   pinMode(STICK_Y, INPUT_PULLUP);
   delay(5);
@@ -148,13 +150,14 @@ void calibrateThumbstick() {
 }
 
 // Read touch screen and map coordinates to Landscape (320x240)
-bool getLandscapeTouch(int &px, int &py) {
+bool getLandscapeTouchRaw(int &px, int &py, int &rawX, int &rawY) {
   TSPoint p = ts.getPoint();
   restoreTFTPins();
 
   if (p.z > MINPRESSURE && p.z < MAXPRESSURE) {
-    // In Landscape (setRotation(1)), touch p.y maps to Screen X (0..320)
-    // and touch p.x maps to Screen Y (0..240)
+    rawX = p.x;
+    rawY = p.y;
+
     if (INVERT_TOUCH_X) {
       px = map(p.y, TS_MAXY, TS_MINY, 0, 320);
     } else {
@@ -172,6 +175,11 @@ bool getLandscapeTouch(int &px, int &py) {
     return true;
   }
   return false;
+}
+
+bool getLandscapeTouch(int &px, int &py) {
+  int rx, ry;
+  return getLandscapeTouchRaw(px, py, rx, ry);
 }
 
 // Check if any active input is currently held down
@@ -205,6 +213,13 @@ void waitForRelease() {
 
 // Populate and shuffle the 5 levels for the current stage
 void generateStagePool() {
+  if (debugForceMode != -1) {
+    for (uint8_t i = 0; i < 5; i++) {
+      stagePool[i] = (uint8_t)debugForceMode;
+    }
+    return;
+  }
+
   stagePool[0] = GAME_TOUCH;
   stagePool[1] = GAME_STICK;
   stagePool[2] = GAME_BUTTONS;
@@ -228,27 +243,48 @@ void drawHUD() {
   tft.setTextColor(WHITE);
   tft.setTextSize(2);
   tft.setCursor(8, 6);
-  tft.print("STG:");
+  tft.print(F("STG:"));
   tft.print(currentStage);
 
   if (stage5Loops > 0) {
     tft.setTextColor(YELLOW);
-    tft.print("+");
+    tft.print(F("+"));
     tft.print(stage5Loops);
   }
 
-  // Wins (W:x/3) and Level (L:x/5) fit cleanly on the 320px wide top bar
   tft.setTextColor(CYAN);
   tft.setCursor(165, 6);
-  tft.print("W:");
+  tft.print(F("W:"));
   tft.print(winsInStage);
-  tft.print("/3 L:");
+  tft.print(F("/3 L:"));
   tft.print(levelInStage + 1);
-  tft.print("/5");
+  tft.print(F("/5"));
 
   // Landscape Timer bar frame (300px inner width)
   tft.drawRect(8, 26, 304, 12, WHITE);
   tft.fillRect(10, 28, 300, 8, GREEN);
+}
+
+// Draw live next-step hint in HUD if Debug Hints or God Mode is enabled
+void drawDebugHint(uint8_t stepIndex) {
+  if (debugCheatLevel == 0) return;
+
+  tft.fillRect(98, 4, 64, 18, MAGENTA);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(102, 9);
+
+  uint8_t target = sequence[stepIndex];
+  if (activeGame == GAME_STICK) {
+    const char* dirNames[4] = {"NXT:UP", "NXT:DN", "NXT:LT", "NXT:RT"};
+    tft.print(dirNames[target]);
+  } else if (activeGame == GAME_TOUCH) {
+    const char* padNames[4] = {"PAD:TL", "PAD:TR", "PAD:BL", "PAD:BR"};
+    tft.print(padNames[target]);
+  } else {
+    tft.print(F("BTN: #"));
+    tft.print(target + 1);
+  }
 }
 
 void updateTimerBar(unsigned long elapsed, unsigned long limit, int &lastWidth, uint16_t &lastColor) {
@@ -274,7 +310,6 @@ void updateTimerBar(unsigned long elapsed, unsigned long limit, int &lastWidth, 
 }
 
 // --- MINIGAME 1: TOUCH SCREEN (2x2 Grid in Landscape) ---
-// Pads are 110x70: Left col x=40, Right col x=170 | Top row y=74, Bottom row y=156
 void drawTouchPad(uint8_t index, bool lit) {
   int x = (index % 2 == 0) ? 40 : 170;
   int y = (index < 2) ? 74 : 156;
@@ -293,14 +328,13 @@ void drawTouchBoard() {
   tft.setTextColor(WHITE);
   tft.setTextSize(2);
   tft.setCursor(70, 50);
-  tft.print("MODE: TOUCH PAD");
+  tft.print(F("MODE: TOUCH PAD"));
   for (uint8_t i = 0; i < 4; i++) {
     drawTouchPad(i, false);
   }
 }
 
 // --- MINIGAME 2: SLIDE THUMBSTICK (4 Directional Arrows in Landscape) ---
-// Centered around (160, 152)
 void drawStickArrow(uint8_t dir, bool lit) {
   uint16_t color = lit ? YELLOW : DARKGREY;
 
@@ -324,7 +358,7 @@ void drawStickBoard() {
   tft.setTextColor(CYAN);
   tft.setTextSize(2);
   tft.setCursor(64, 50);
-  tft.print("MODE: THUMBSTICK");
+  tft.print(F("MODE: THUMBSTICK"));
   tft.fillCircle(160, 152, 14, DARKGREY);
   for (uint8_t i = 0; i < 4; i++) {
     drawStickArrow(i, false);
@@ -332,7 +366,6 @@ void drawStickBoard() {
 }
 
 // --- MINIGAME 3: 3 PUSH BUTTONS (in Landscape) ---
-// Centered at x = 65, 160, 255, y = 152
 void drawButtonIcon(uint8_t index, bool lit) {
   int x = 65 + (index * 95);
   int y = 152;
@@ -353,7 +386,7 @@ void drawButtonBoard() {
   tft.setTextColor(ORANGE);
   tft.setTextSize(2);
   tft.setCursor(70, 50);
-  tft.print("MODE: 3 BUTTONS");
+  tft.print(F("MODE: 3 BUTTONS"));
   for (uint8_t i = 0; i < 3; i++) {
     drawButtonIcon(i, false);
   }
@@ -390,6 +423,35 @@ void playSequence() {
   }
 }
 
+// Reads thumbstick direction (with RIGHT and DOWN swapped to match your hardware/screen)
+int8_t readStickDirection(bool touched, int px, int py) {
+  // 1. Check physical slide thumbstick if it is wired up
+  if (stickConnected) {
+    int sx = readCleanAnalog(STICK_X);
+    int sy = readCleanAnalog(STICK_Y);
+    int dx = sx - stickCenterX;
+    int dy = sy - stickCenterY;
+
+    if (abs(dy) >= abs(dx)) {
+      if (dy >  STICK_TRIGGER_DIST) return DIR_UP;
+      if (dy < -STICK_TRIGGER_DIST) return DIR_RIGHT; // Swapped: was DIR_DOWN
+    } else {
+      if (dx < -STICK_TRIGGER_DIST) return DIR_LEFT;
+      if (dx >  STICK_TRIGGER_DIST) return DIR_DOWN;  // Swapped: was DIR_RIGHT
+    }
+  }
+
+  // 2. Touchscreen fallback (also with RIGHT and DOWN swapped)
+  if (touched) {
+    if (px >= 120 && px <= 200 && py >= 68 && py <= 122)  return DIR_UP;
+    if (px >= 120 && px <= 200 && py >= 182 && py <= 236) return DIR_RIGHT; // Swapped: was DIR_DOWN
+    if (px >= 55 && px <= 122 && py >= 118 && py <= 186)  return DIR_LEFT;
+    if (px >= 198 && px <= 265 && py >= 118 && py <= 186) return DIR_DOWN;  // Swapped: was DIR_RIGHT
+  }
+
+  return -1;
+}
+
 int8_t pollActiveInput() {
   int px, py;
   bool touched = getLandscapeTouch(px, py);
@@ -406,37 +468,13 @@ int8_t pollActiveInput() {
     }
   } 
   else if (activeGame == GAME_STICK) {
-    // 1. Check physical slide thumbstick if it is wired up
-    if (stickConnected) {
-      int sx = readCleanAnalog(STICK_X);
-      int sy = readCleanAnalog(STICK_Y);
-      int dx = sx - stickCenterX;
-      int dy = sy - stickCenterY;
-
-      if (abs(dy) >= abs(dx)) {
-        if (dy >  STICK_TRIGGER_DIST) return DIR_UP;
-        if (dy < -STICK_TRIGGER_DIST) return DIR_DOWN;
-      } else {
-        if (dx < -STICK_TRIGGER_DIST) return DIR_LEFT;
-        if (dx >  STICK_TRIGGER_DIST) return DIR_RIGHT;
-      }
-    }
-
-    // 2. Touchscreen fallback so you can test thumbstick rounds without the stick wired
-    if (touched) {
-      if (px >= 120 && px <= 200 && py >= 68 && py <= 122)  return DIR_UP;
-      if (px >= 120 && px <= 200 && py >= 182 && py <= 236) return DIR_DOWN;
-      if (px >= 55 && px <= 122 && py >= 118 && py <= 186)  return DIR_LEFT;
-      if (px >= 198 && px <= 265 && py >= 118 && py <= 186) return DIR_RIGHT;
-    }
+    return readStickDirection(touched, px, py);
   } 
   else if (activeGame == GAME_BUTTONS) {
-    // 1. Check physical push buttons
     if (digitalRead(BTN_1) == LOW) return 0;
     if (digitalRead(BTN_2) == LOW) return 1;
     if (digitalRead(BTN_3) == LOW) return 2;
 
-    // 2. Touchscreen fallback so you can test button rounds without buttons wired
     if (touched && py >= 112 && py <= 192) {
       if (px >= 25 && px <= 105)  return 0; // Button 1
       if (px >= 120 && px <= 200) return 1; // Button 2
@@ -448,7 +486,180 @@ int8_t pollActiveInput() {
 }
 
 // ==========================================
-// 6. ROUND & STAGE MANAGEMENT
+// 6. SECRET DEBUG MENU
+// ==========================================
+
+void drawDebugButtons() {
+  // Button 1: Stage Selector (Top-Left)
+  tft.fillRect(10, 32, 145, 48, BLUE);
+  tft.drawRect(10, 32, 145, 48, WHITE);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(18, 48);
+  tft.print(F("STG: "));
+  if (debugStartStage <= 5) {
+    tft.print(debugStartStage);
+  } else {
+    tft.setTextColor(YELLOW);
+    tft.print(F("5+OT"));
+  }
+
+  // Button 2: Force Mode Selector (Top-Right)
+  tft.fillRect(165, 32, 145, 48, DARKGREY);
+  tft.drawRect(165, 32, 145, 48, WHITE);
+  tft.setTextColor(CYAN);
+  tft.setCursor(173, 48);
+  if (debugForceMode == -1)     tft.print(F("MODE: ALL"));
+  else if (debugForceMode == 0) tft.print(F("MODE: TCH"));
+  else if (debugForceMode == 1) tft.print(F("MODE: STK"));
+  else if (debugForceMode == 2) tft.print(F("MODE: BTN"));
+
+  // Button 3: Cheat / God Mode Toggle (Mid-Left)
+  uint16_t cheatBg = (debugCheatLevel == 0) ? DARKGREY : (debugCheatLevel == 1 ? MAGENTA : ORANGE);
+  tft.fillRect(10, 88, 145, 48, cheatBg);
+  tft.drawRect(10, 88, 145, 48, WHITE);
+  tft.setTextColor(WHITE);
+  tft.setCursor(18, 104);
+  if (debugCheatLevel == 0)      tft.print(F("CHT: OFF"));
+  else if (debugCheatLevel == 1) tft.print(F("CHT: HINT"));
+  else                           tft.print(F("CHT: GOD"));
+
+  // Button 4: Start Game (Mid-Right)
+  tft.fillRect(165, 88, 145, 48, GREEN);
+  tft.drawRect(165, 88, 145, 48, WHITE);
+  tft.setTextColor(BLACK);
+  tft.setCursor(178, 104);
+  tft.print(F("START >>"));
+}
+
+void runDebugMenu() {
+  tft.fillScreen(BLACK);
+  tft.fillRect(0, 0, 320, 26, MAGENTA);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(45, 5);
+  tft.print(F("SECRET DEBUG MODE"));
+
+  drawDebugButtons();
+
+  // Live Hardware Inspector Box
+  tft.drawRect(10, 144, 300, 90, WHITE);
+  tft.setTextSize(1);
+  tft.setTextColor(YELLOW);
+  tft.setCursor(18, 150);
+  tft.print(F("LIVE INPUT MONITOR (Touch anywhere to test):"));
+
+  waitForRelease();
+
+  int lastCrossX = -1;
+  int lastCrossY = -1;
+
+  while (true) {
+    int px = 0, py = 0, rawX = 0, rawY = 0;
+    bool touched = getLandscapeTouchRaw(px, py, rawX, rawY);
+
+    // Physical Button Shortcuts inside Debug Menu
+    if (digitalRead(BTN_1) == LOW) {
+      waitForRelease();
+      break; // Start Game
+    }
+    if (digitalRead(BTN_2) == LOW) {
+      debugForceMode++;
+      if (debugForceMode > 2) debugForceMode = -1;
+      drawDebugButtons();
+      waitForRelease();
+    }
+    if (digitalRead(BTN_3) == LOW) {
+      debugCheatLevel = (debugCheatLevel + 1) % 3;
+      drawDebugButtons();
+      waitForRelease();
+    }
+
+    // Check Touch Buttons
+    if (touched) {
+      // Draw a live yellow crosshair dot where the touch registered
+      if (lastCrossX != -1) {
+        tft.fillCircle(lastCrossX, lastCrossY, 3, BLACK);
+      }
+      tft.fillCircle(px, py, 3, YELLOW);
+      lastCrossX = px;
+      lastCrossY = py;
+
+      if (py >= 32 && py <= 80) {
+        if (px >= 10 && px <= 155) {
+          debugStartStage++;
+          if (debugStartStage > 6) debugStartStage = 1;
+          drawDebugButtons();
+          waitForRelease();
+        } else if (px >= 165 && px <= 310) {
+          debugForceMode++;
+          if (debugForceMode > 2) debugForceMode = -1;
+          drawDebugButtons();
+          waitForRelease();
+        }
+      } else if (py >= 88 && py <= 136) {
+        if (px >= 10 && px <= 155) {
+          debugCheatLevel = (debugCheatLevel + 1) % 3;
+          drawDebugButtons();
+          waitForRelease();
+        } else if (px >= 165 && px <= 310) {
+          waitForRelease();
+          break; // Exit Debug Menu & Start Game
+        }
+      }
+    }
+
+    // Update Live Hardware Readout every frame
+    int sx = readCleanAnalog(STICK_X);
+    int sy = readCleanAnalog(STICK_Y);
+    int8_t sDir = readStickDirection(touched, px, py);
+
+    tft.fillRect(16, 164, 288, 64, BLACK);
+    tft.setTextSize(1);
+
+    // Line 1: Thumbstick values & direction
+    tft.setTextColor(CYAN);
+    tft.setCursor(18, 166);
+    tft.print(F("STICK A4(X):"));
+    tft.print(sx);
+    tft.print(F(" A5(Y):"));
+    tft.print(sy);
+    tft.print(F(" Dir:"));
+    if (sDir == DIR_UP)         tft.print(F("UP"));
+    else if (sDir == DIR_DOWN)  tft.print(F("DOWN"));
+    else if (sDir == DIR_LEFT)  tft.print(F("LEFT"));
+    else if (sDir == DIR_RIGHT) tft.print(F("RIGHT"));
+    else                        tft.print(F("IDLE"));
+
+    // Line 2: Touch Screen raw & mapped coordinates
+    tft.setTextColor(GREEN);
+    tft.setCursor(18, 184);
+    tft.print(F("TOUCH px:"));
+    tft.print(px);
+    tft.print(F(" py:"));
+    tft.print(py);
+    tft.print(F(" (Raw "));
+    tft.print(rawX);
+    tft.print(F(","));
+    tft.print(rawY);
+    tft.print(F(")"));
+
+    // Line 3: Digital Push Buttons
+    tft.setTextColor(ORANGE);
+    tft.setCursor(18, 202);
+    tft.print(F("BTNS  D10:"));
+    tft.print(digitalRead(BTN_1) == LOW ? F("ON ") : F("OFF"));
+    tft.print(F(" D11:"));
+    tft.print(digitalRead(BTN_2) == LOW ? F("ON ") : F("OFF"));
+    tft.print(F(" D12:"));
+    tft.print(digitalRead(BTN_3) == LOW ? F("ON") : F("OFF"));
+
+    delay(40);
+  }
+}
+
+// ==========================================
+// 7. ROUND & STAGE MANAGEMENT
 // ==========================================
 
 bool runMinigameRound() {
@@ -467,9 +678,12 @@ bool runMinigameRound() {
   uint16_t lastBarColor = GREEN;
   uint8_t stepIndex = 0;
 
+  drawDebugHint(stepIndex);
+
   while (stepIndex < currentSeqLen) {
     unsigned long elapsed = millis() - startTime;
     if (elapsed >= timeLimitMs) {
+      if (debugCheatLevel == 2) return true; // God mode never fails on timeout
       return false; // Timed out
     }
 
@@ -483,17 +697,18 @@ bool runMinigameRound() {
       highlightStep(userChoice, false);
       startTime += (millis() - flashStart);
 
-      if (userChoice != sequence[stepIndex]) {
+      if (userChoice != sequence[stepIndex] && debugCheatLevel < 2) {
         waitForRelease();
         return false;
       }
 
       stepIndex++;
-
       if (stepIndex < currentSeqLen) {
+        drawDebugHint(stepIndex);
         while (isAnyInputHeld()) {
           unsigned long heldElapsed = millis() - startTime;
           if (heldElapsed >= timeLimitMs) {
+            if (debugCheatLevel == 2) return true;
             return false;
           }
           updateTimerBar(heldElapsed, timeLimitMs, lastBarWidth, lastBarColor);
@@ -521,26 +736,61 @@ void showBanner(const char* line1, const char* line2, uint16_t bgColor) {
 }
 
 void resetGame() {
-  currentStage = 1;
+  if (debugStartStage <= 5) {
+    currentStage = debugStartStage;
+    stage5Loops = 0;
+    timeLimitMs = 20000;
+  } else {
+    currentStage = 5;
+    stage5Loops = 1;
+    timeLimitMs = 17500;
+  }
   levelInStage = 0;
   winsInStage = 0;
   failsInStage = 0;
   totalErrors = 0;
-  stage5Loops = 0;
-  timeLimitMs = 20000;
   generateStagePool();
 }
 
 void waitToStartOrRestart() {
   tft.setTextColor(YELLOW);
   tft.setTextSize(2);
-  tft.setCursor(45, 200);
-  tft.println("Press Btn 1 or Tap");
+  tft.setCursor(45, 192);
+  tft.println(F("Press Btn 1 or Tap"));
+
+  tft.setTextColor(WHITE);
+  tft.setTextSize(1);
+  tft.setCursor(52, 218);
+  tft.println(F("(Hold Touch 1.2s for Debug Menu)"));
+
+  bool openDebug = false;
 
   while (true) {
     if (digitalRead(BTN_1) == LOW) break;
+
+    // Pressing Button 2 or Button 3 opens Secret Debug Mode immediately
+    if (digitalRead(BTN_2) == LOW || digitalRead(BTN_3) == LOW) {
+      openDebug = true;
+      break;
+    }
+
     int px, py;
-    if (getLandscapeTouch(px, py)) break;
+    if (getLandscapeTouch(px, py)) {
+      unsigned long holdStart = millis();
+      // Measure how long the player holds their finger on the screen
+      while (getLandscapeTouch(px, py)) {
+        unsigned long heldMs = millis() - holdStart;
+        int barW = map(constrain(heldMs, 0, 1200), 0, 1200, 0, 200);
+        tft.fillRect(60, 228, barW, 4, MAGENTA);
+
+        if (heldMs >= 1200) {
+          openDebug = true;
+          break;
+        }
+        delay(20);
+      }
+      break; // Quick tap starts game; 1.2s hold opens Debug Menu
+    }
     delay(20);
   }
 
@@ -550,11 +800,14 @@ void waitToStartOrRestart() {
   }
 
   waitForRelease();
+  if (openDebug) {
+    runDebugMenu();
+  }
   resetGame();
 }
 
 // ==========================================
-// 7. SETUP & LOOP
+// 8. SETUP & LOOP
 // ==========================================
 
 void setup() {
@@ -584,21 +837,21 @@ void setup() {
   tft.drawRect(6, 6, 308, 228, WHITE);
   tft.setTextColor(WHITE);
   tft.setTextSize(3);
-  tft.setCursor(52, 55);
-  tft.println("MEMORY BLITZ");
+  tft.setCursor(52, 50);
+  tft.println(F("MEMORY BLITZ"));
 
   tft.setTextSize(2);
-  tft.setCursor(45, 110);
-  tft.println("Pass 3 of 5 Levels");
+  tft.setCursor(45, 105);
+  tft.println(F("Pass 3 of 5 Levels"));
 
   // Shows hardware detection status right on the title screen
   tft.setTextSize(1);
   tft.setTextColor(CYAN);
-  tft.setCursor(65, 155);
+  tft.setCursor(65, 150);
   if (stickConnected) {
-    tft.println("Thumbstick: DETECTED (A4/A5)");
+    tft.println(F("Thumbstick: DETECTED (A4/A5)"));
   } else {
-    tft.println("Thumbstick: UNPLUGGED (Touch Mode)");
+    tft.println(F("Thumbstick: UNPLUGGED (Touch Mode)"));
   }
 
   waitToStartOrRestart();
@@ -621,14 +874,14 @@ void loop() {
     tft.fillScreen(RED);
     tft.setTextColor(WHITE);
     tft.setTextSize(3);
-    tft.setCursor(70, 55);
-    tft.println("GAME OVER!");
+    tft.setCursor(70, 50);
+    tft.println(F("GAME OVER!"));
     tft.setTextSize(2);
-    tft.setCursor(55, 110);
-    tft.print("Stage Reached: ");
+    tft.setCursor(55, 105);
+    tft.print(F("Stage Reached: "));
     tft.println(currentStage);
-    tft.setCursor(55, 140);
-    tft.print("Stage 5 Loops: ");
+    tft.setCursor(55, 135);
+    tft.print(F("Stage 5 Loops: "));
     tft.println(stage5Loops);
     waitToStartOrRestart();
     return;
@@ -652,27 +905,27 @@ void loop() {
         tft.fillScreen(MAGENTA);
         tft.setTextColor(WHITE);
         tft.setTextSize(3);
-        tft.setCursor(52, 55);
-        tft.println("FLAWLESS S5!");
+        tft.setCursor(52, 50);
+        tft.println(F("FLAWLESS S5!"));
         tft.setTextSize(2);
-        tft.setCursor(55, 110);
-        tft.println("Repeating Stage 5");
-        tft.setCursor(55, 140);
-        tft.print("New Timer: ");
+        tft.setCursor(55, 105);
+        tft.println(F("Repeating Stage 5"));
+        tft.setCursor(55, 135);
+        tft.print(F("New Timer: "));
         tft.print(timeLimitMs / 1000.0, 1);
-        tft.println("s");
+        tft.println(F("s"));
         delay(2200);
       } else {
         tft.fillScreen(BLUE);
         tft.setTextColor(WHITE);
         tft.setTextSize(3);
-        tft.setCursor(85, 55);
-        tft.println("YOU WIN!");
+        tft.setCursor(85, 50);
+        tft.println(F("YOU WIN!"));
         tft.setTextSize(2);
-        tft.setCursor(55, 110);
-        tft.println("Stage 5 Complete!");
-        tft.setCursor(55, 140);
-        tft.println("Go Flawless for OT");
+        tft.setCursor(55, 105);
+        tft.println(F("Stage 5 Complete!"));
+        tft.setCursor(55, 135);
+        tft.println(F("Go Flawless for OT"));
         waitToStartOrRestart();
       }
     }
