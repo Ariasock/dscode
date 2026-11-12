@@ -1039,16 +1039,16 @@ void showTitleScreen() {
   tft.drawRect(6, 6, 308, 228, WHITE);
   tft.setTextColor(WHITE);
   tft.setTextSize(3);
-  tft.setCursor(16, 50); // Centered for 16 chars ("Test your skill!") at size 3
+  tft.setCursor(16, 45); // Centered for 16 chars ("Test your skill!") at size 3
   tft.println(F("Test your skill!"));
 
   tft.setTextSize(2);
-  tft.setCursor(45, 105);
+  tft.setCursor(45, 98);
   tft.println(F("Pass 3 of 5 Levels"));
 
   tft.setTextSize(1);
   tft.setTextColor(CYAN);
-  tft.setCursor(52, 150);
+  tft.setCursor(52, 142);
   if (EEPROM.read(EEPROM_CAL_MAGIC_ADDR) == EEPROM_CAL_MAGIC_VAL) {
     tft.println(F("Thumbstick: CALIBRATED (Saved in EEPROM)"));
   } else if (stickConnected) {
@@ -1059,17 +1059,22 @@ void showTitleScreen() {
 }
 
 void waitToStartOrRestart() {
+  // Prompt to start normal game
   tft.setTextColor(YELLOW);
   tft.setTextSize(2);
-  tft.setCursor(45, 192);
+  tft.setCursor(45, 174);
   tft.println(F("Press Btn A or Tap"));
 
+  // Labeled clickable button on screen to enter Debug Mode with a simple tap
+  tft.fillRect(85, 200, 150, 26, MAGENTA);
+  tft.drawRect(85, 200, 150, 26, WHITE);
   tft.setTextColor(WHITE);
   tft.setTextSize(1);
-  tft.setCursor(52, 218);
-  tft.println(F("(Hold Touch 1.2s for Debug Menu)"));
+  tft.setCursor(112, 209);
+  tft.print(F("[ DEBUG MENU ]"));
 
   bool openDebug = false;
+  waitForRelease();
 
   while (true) {
     if (isButtonPressed(BTN_A)) break;
@@ -1081,17 +1086,9 @@ void waitToStartOrRestart() {
 
     int px, py;
     if (getLandscapeTouch(px, py)) {
-      unsigned long holdStart = millis();
-      while (getLandscapeTouch(px, py)) {
-        unsigned long heldMs = millis() - holdStart;
-        int barW = map(constrain(heldMs, 0, 1200), 0, 1200, 0, 200);
-        tft.fillRect(60, 228, barW, 4, MAGENTA);
-
-        if (heldMs >= 1200) {
-          openDebug = true;
-          break;
-        }
-        delay(20);
+      // Check if tap landed inside the [ DEBUG MENU ] button (with a slight padding margin)
+      if (px >= 80 && px <= 240 && py >= 195 && py <= 232) {
+        openDebug = true;
       }
       break;
     }
